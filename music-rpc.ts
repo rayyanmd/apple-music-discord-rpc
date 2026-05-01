@@ -4,6 +4,69 @@ import { Client } from "https://deno.land/x/discord_rpc@0.3.2/mod.ts";
 import type {} from "https://raw.githubusercontent.com/NextFire/jxa/v0.0.5/run/global.d.ts";
 import { run } from "https://raw.githubusercontent.com/NextFire/jxa/v0.0.5/run/mod.ts";
 import type { iTunes } from "https://raw.githubusercontent.com/NextFire/jxa/v0.0.5/run/types/core.d.ts";
+import { createHash } from "node:crypto"
+
+//#region LastFM
+class LastFM {
+  private readonly apiUrl = "https://ws.audioscrobbler.com/2.0/";
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly apiSecret: string,
+    private readonly sessionKey: string,
+  ) {}
+
+  private sign(params: Record<string, string>): string {
+    const sorted = Object.keys(params).sort()
+      .filter((k) => k !== "format")
+      .map((k) => `${k}${params[k]}`)
+      .join("") + this.apiSecret;
+
+    return this.md5(sorted);
+  }
+
+  private md5(str: string): string {
+    return createHash("md5").update(str).digest("hex");
+  }
+
+  async updateNowPlaying(props: iTunesProperties): Promise<void> {
+    const params: Record<string, string> = {
+      method: "track.updateNowPlaying",
+      track: props.name,
+      artist: props.artist,
+      album: props.album,
+      api_key: this.apiKey,
+      sk: this.sessionKey,
+    };
+    params.api_sig = this.sign(params);
+    params.format = "json";
+    await this.post(params);
+    console.log("Last.fm now playing updated");
+  }
+
+  async scrobble(props: iTunesProperties, timestamp: number): Promise<void> {
+    const params: Record<string, string> = {
+      method: "track.scrobble",
+      track: props.name,
+      artist: props.artist,
+      album: props.album,
+      timestamp: String(Math.floor(timestamp / 1000)),
+      api_key: this.apiKey,
+      sk: this.sessionKey,
+    };
+    params.api_sig = this.sign(params);
+    params.format = "json";
+    await this.post(params);
+    console.log("Last.fm scrobbled:", props.name);
+  }
+
+  private async post(params: Record<string, string>): Promise<void> {
+    const body = new URLSearchParams(params);
+    const resp = await fetch(this.apiUrl, { method: "POST", body });
+    if (!resp.ok) console.error("Last.fm error:", await resp.text());
+  }
+}
+//#endregion LastFM
 
 //#region RPC
 class AppleMusicDiscordRPC {
@@ -15,6 +78,9 @@ class AppleMusicDiscordRPC {
   static readonly KV_VERSION = 3;
 
   private startTime!: number;
+  private lastScrobbledId: string | null = null;
+  private trackStartTime: number | null = null;
+  private currentTrackId: string | null = null;
 
   /**
    * @private Use `AppleMusicDiscordRPC.create()` instead.
@@ -23,6 +89,7 @@ class AppleMusicDiscordRPC {
     private readonly appName: iTunesAppName,
     private readonly rpc: Client,
     private readonly kv: Deno.Kv,
+    private readonly lastfm: LastFM,
     private readonly defaultTimeout: number = 15 * 1000,
     private readonly maxRuntime: number = 24 * 60 * 60 * 1000, // 24 hours
   ) {}
@@ -113,6 +180,28 @@ class AppleMusicDiscordRPC {
     const properties = await getMusicProperties(this.appName);
     console.log("properties:", properties);
 
+    // New track started
+    if (properties.persistentID !== this.currentTrackId) {
+      this.currentTrackId = properties.persistentID;
+      this.trackStartTime = Date.now() - properties.playerPosition * 1000;
+      this.lastScrobbledId = null;
+      await this.lastfm.updateNowPlaying(properties);
+    }
+
+    // Scrobble rule: track must be >30s long AND you've listened for
+    // >50% of it or >4 minutes, whichever comes first
+    const listenedMs = Date.now() - (this.trackStartTime ?? Date.now());
+    const durationMs = (properties.duration ?? 0) * 1000;
+    const shouldScrobble =
+      durationMs > 30_000 &&
+      (listenedMs >= durationMs * 0.5 || listenedMs >= 4 * 60 * 1000) &&
+      this.lastScrobbledId !== properties.persistentID;
+
+    if (shouldScrobble) {
+      await this.lastfm.scrobble(properties, this.trackStartTime!);
+      this.lastScrobbledId = properties.persistentID;
+    }
+
     let delta, start, end;
     if (properties.duration) {
       delta = (properties.duration - properties.playerPosition) * 1000;
@@ -186,13 +275,18 @@ class AppleMusicDiscordRPC {
 
   static async create(
     ...opts: ConstructorParameters<typeof this> extends
-      [unknown, unknown, unknown, ...infer T] ? T : never
+      [unknown, unknown, unknown, unknown, ...infer T] ? T : never
   ): Promise<AppleMusicDiscordRPC> {
     const macOSVersion = await this.getMacOSVersion();
     const appName: iTunesAppName = macOSVersion >= 10.15 ? "Music" : "iTunes";
     const rpc = new Client({ id: this.CLIENT_IDS[appName] });
     const kv = await Deno.openKv(`cache_v${this.KV_VERSION}.sqlite3`);
-    return new this(appName, rpc, kv, ...opts);
+    const lastfm = new LastFM(
+      Deno.env.get("LASTFM_API_KEY")!,
+      Deno.env.get("LASTFM_API_SECRET")!,
+      Deno.env.get("LASTFM_SESSION_KEY")!,
+    );
+    return new this(appName, rpc, kv, lastfm, ...opts);
   }
 
   static async getMacOSVersion(): Promise<number> {
